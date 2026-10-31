@@ -1,7 +1,8 @@
 // ==========================================================================
-// PROJECT: ULTIMATE RGB INVADERS - V10.9.5 (Simon says fix)
+// PROJECT: RGB INVADERS - V10.9.5 + guided training / normalized motion
 // HARDWARE: ESP32-S3 (N16), MAX98357A, WS2812B
-// CORE VERSION: 2.0.17 (Required!) I2S driver issues with 3.x.x
+// CORE: original baseline 2.0.17; builds with 3.3.11 / FastLED 3.10.8
+// Physical LED/audio validation on the newer core remains outstanding.
 // ==========================================================================
 
 #include <WiFi.h>
@@ -30,8 +31,8 @@
 
 #define PIN_BTN_BLUE    15
 #define PIN_BTN_RED     16
-#define PIN_BTN_GREEN   17
-#define PIN_BTN_WHITE   18 
+#define PIN_BTN_GREEN   8
+#define PIN_BTN_WHITE   9
 
 #define CONFIG_VERSION  42 // Version 10.9.5
 #define FRAME_DELAY     16 // ~60 FPS
@@ -49,14 +50,15 @@ enum SoundEvent {
   EVT_SHOT_BLUE, EVT_SHOT_RED, EVT_SHOT_GREEN, EVT_SHOT_WHITE,
   EVT_SHOT_YELLOW, EVT_SHOT_MAGENTA, EVT_SHOT_CYAN, 
   EVT_FINAL_WIN,
-  EVT_BONUS_START, EVT_BONUS_WAVE, EVT_BONUS_SPEEDUP
+  EVT_BONUS_START, EVT_BONUS_WAVE, EVT_BONUS_SPEEDUP, EVT_BLOCKED, EVT_DANGER, EVT_SHIELD
 };
 
 enum GameState { 
   STATE_MENU, STATE_INTRO, STATE_PLAYING, STATE_BOSS_PLAYING, 
   STATE_LEVEL_COMPLETED, STATE_GAME_FINISHED, STATE_BASE_DESTROYED, STATE_GAMEOVER,
   STATE_BONUS_INTRO, STATE_BONUS_PLAYING, // Beatsaber
-  STATE_BONUS_SIMON // Simon Says
+  STATE_BONUS_SIMON, // Simon Says
+  STATE_TRAINING
 };
 
 enum Boss2State { B2_MOVE, B2_CHARGE, B2_SHOOT };
@@ -119,7 +121,7 @@ String hex_cb = "#222222"; // Dark
 
 CRGB col_c1, col_c2, col_c3, col_c4, col_c5, col_c6, col_cw, col_cb;
 Melody melStart, melWin, melLose, melMistake, melShotBlue, melShotRed, melShotGreen, melShotWhite, melHit, melFinalWin, melSpeedUp;
-Melody melShotY, melShotM, melShotC;
+Melody melShotY, melShotM, melShotC, melBlocked, melDanger, melShield;
 
 // Config
 int config_num_leds = 100;
@@ -133,6 +135,7 @@ int ledStartOffset = 1;
 bool config_sound_on = true;
 int config_volume_pct = 50;
 bool config_endless_mode = false;
+bool config_training_on_start = false;
 String currentProfilePrefix = "def_"; 
 String config_ssid = "";
 String config_pass = "";
@@ -174,6 +177,10 @@ int boss1WrongHits = 0; bool boss1RageMode = false;
 int boss1RageShots = 0;
 Boss3State boss3State = B3_MOVE;
 int boss3PhaseIndex = 0; int boss3BurstCounter = 0; int boss3Markers[2];
+const int MAX_SHIELD = 3;
+const unsigned long SHIELD_RECOVERY_MS = 1000;
+int shieldPoints = MAX_SHIELD;
+unsigned long shieldRecoveryUntil = 0;
 int currentScore = 0;
 int highScore = 0; int lastGames[3] = {0, 0, 0};
 unsigned long levelStartTime = 0;
@@ -206,12 +213,221 @@ int simonInputIdx = 0;
 unsigned long simonTimer = 0;
 int simonTargetPos = 0;      
 
+// Guided practice does not write scores, kills, or shot statistics.
+enum FeedbackKind { FB_NONE, FB_HIT, FB_MISTAKE, FB_BLOCKED, FB_DANGER, FB_INTERCEPT, FB_LESSON, FB_SHIELD };
+FeedbackKind feedbackKind = FB_NONE;
+const char* feedbackText = "";
+unsigned long feedbackUntil = 0;
+bool baseInDanger = false;
+float frameSeconds = 0.016f;
+int trainingStage = 0;
+int trainingHits = 0;
+int trainingTargetColor = 2;
+float trainingFront = 0;
+unsigned long trainingAdvanceAt = 0;
+bool trainingMistakeShown = false;
+int trainingAddedColor = 0;
+
 // --------------------------------------------------------------------------
 // 3. HELPER FUNCTIONS
 // --------------------------------------------------------------------------
 CRGB hexToCRGB(String hex) {
   long number = strtol(&hex[1], NULL, 16);
   return CRGB((number >> 16) & 0xFF, (number >> 8) & 0xFF, number & 0xFF);
+}
+
+// Speeds are measured on a reference 240-LED board, then scaled by playable distance.
+float trackLength() { return max(1, config_num_leds - 1 - config_homebase_size); }
+float movementScale() { return trackLength() / max(1, 239 - config_homebase_size); }
+float movementStep(float referenceLedsPerSecond) { return referenceLedsPerSecond * movementScale() * frameSeconds; }
+int trackMarker(int percent) { return config_homebase_size + (int)(trackLength() * percent / 100.0f); }
+
+void resetShield() {
+  shieldPoints = MAX_SHIELD;
+  shieldRecoveryUntil = 0;
+}
+
+bool shieldRecovering() {
+  return shieldRecoveryUntil != 0 && (long)(shieldRecoveryUntil - millis()) > 0;
+}
+
+// Called only for main-game breaches. Training and bonus lives stay separate.
+bool damageShield() {
+  if (currentState != STATE_PLAYING && currentState != STATE_BOSS_PLAYING) return false;
+  float safeFront = config_homebase_size + trackLength() * 0.25f;
+  if (shieldRecovering()) {
+    if (enemyFrontIndex <= config_homebase_size) enemyFrontIndex = safeFront;
+    return false;
+  }
+  if (shieldPoints <= 0) return false;
+  shieldPoints--;
+  bossProjectiles.clear();
+  if (shieldPoints == 0) {
+    setFeedback(FB_SHIELD, "SHIELD DEPLETED: base lost - press Menu to restart");
+    triggerBaseDestruction();
+    return true;
+  }
+  shieldRecoveryUntil = millis() + SHIELD_RECOVERY_MS;
+  enemyFrontIndex = max(enemyFrontIndex, safeFront);
+  baseInDanger = false;
+  setFeedback(FB_SHIELD, shieldPoints == 2 ? "SHIELD HIT: 2 of 3 remaining" : "SHIELD HIT: 1 of 3 remaining - last chance");
+  playSound(EVT_SHIELD);
+  return true;
+}
+
+void setFeedback(FeedbackKind kind, const char* text) {
+  feedbackKind = kind;
+  feedbackText = text;
+  feedbackUntil = millis() + (kind == FB_HIT || kind == FB_INTERCEPT ? 320 : 1000);
+}
+
+void drawGameFeedback() {
+  bool active = (long)(feedbackUntil - millis()) > 0;
+  CRGB baseColor = baseInDanger ? CRGB(255, 70, 0) : CRGB::White;
+  if (active) {
+    if (feedbackKind == FB_HIT || feedbackKind == FB_INTERCEPT) baseColor = CRGB(0, 255, 100);
+    else if (feedbackKind == FB_MISTAKE) baseColor = CRGB(255, 120, 0);
+    else if (feedbackKind == FB_BLOCKED) baseColor = CRGB(100, 80, 255);
+    else if (feedbackKind == FB_LESSON) baseColor = CRGB(0, 200, 220);
+    else if (feedbackKind == FB_SHIELD) baseColor = CRGB(255, 60, 30);
+  }
+  for (int i = 0; i < config_homebase_size; i++) {
+    CRGB chargeColor = baseColor;
+    if (currentState == STATE_PLAYING || currentState == STATE_BOSS_PLAYING) {
+      // With the default three-pixel base each lit LED is one shield point.
+      // Other base sizes show the same charge as a fractional bar.
+      float charge = shieldPoints * config_homebase_size / (float)MAX_SHIELD - i;
+      if (charge <= 0) chargeColor = CRGB::Black;
+      else if (charge < 1.0f) chargeColor.nscale8((int)(charge * 255));
+    }
+    leds[i + ledStartOffset] = chargeColor;
+  }
+}
+
+void updateDangerFeedback() {
+  bool wasInDanger = baseInDanger;
+  baseInDanger = enemyFrontIndex <= config_homebase_size + trackLength() * 0.15f;
+  for (auto &p : bossProjectiles) {
+    if (p.pos <= config_homebase_size + trackLength() * 0.15f) baseInDanger = true;
+  }
+  if (baseInDanger && !wasInDanger) playSound(EVT_DANGER);
+  if (baseInDanger && (long)(feedbackUntil - millis()) <= 0) setFeedback(FB_DANGER, "DANGER: enemy approaching the base");
+}
+
+String trainingPrompt() {
+  switch (trainingStage) {
+    case 0: return "RED: press the red button (A). Release between shots.";
+    case 1: return "GREEN: press the green button (S).";
+    case 2: return "BLUE: press the blue button (D).";
+    case 3: return "Penalty demo: fire BLUE or GREEN at the RED target. Watch an enemy get added.";
+    case 4: return "YELLOW: press RED + GREEN together (A + S).";
+    case 5: return "MAGENTA: press RED + BLUE together (A + D).";
+    case 6: return "CYAN: press GREEN + BLUE together (S + D).";
+    case 7: return "WHITE: press all three buttons together (A + S + D).";
+    case 8: return "Moving practice: clear RED, then GREEN, then BLUE. No lives or score at risk.";
+    default: return "Training complete! Release the buttons, then press any color to start the campaign.";
+  }
+}
+
+void setTrainingStage(int stage) {
+  const int targets[] = {2, 3, 1, 2, 4, 5, 6, 7, 2};
+  trainingStage = stage;
+  trainingTargetColor = stage < 9 ? targets[stage] : 0;
+  trainingFront = config_homebase_size + trackLength() * (stage == 8 ? 0.8f : 0.5f);
+  trainingHits = 0;
+  trainingAdvanceAt = 0;
+  trainingMistakeShown = false;
+  trainingAddedColor = 0;
+  shots.clear();
+  buttonsReleased = false;
+  isWaitingForCombo = false;
+  setFeedback(FB_LESSON, stage < 9 ? "Practice lesson ready" : "Training complete - press any color to play");
+}
+
+void startTraining() {
+  wifiMode = false;
+  currentState = STATE_TRAINING;
+  currentBossType = 0;
+  baseInDanger = false;
+  enemies.clear(); bossSegments.clear(); bossProjectiles.clear(); shots.clear();
+  setTrainingStage(0);
+  FastLED.setBrightness(map(config_brightness_pct, 10, 100, 25, 255));
+  playSound(EVT_START);
+}
+
+int readTrainingColor() {
+  bool r = digitalRead(PIN_BTN_RED) == LOW;
+  bool g = digitalRead(PIN_BTN_GREEN) == LOW;
+  bool b = digitalRead(PIN_BTN_BLUE) == LOW;
+  if (r && g && b) return 7;
+  if (r && g) return 4;
+  if (r && b) return 5;
+  if (g && b) return 6;
+  if (r) return 2;
+  if (g) return 3;
+  if (b) return 1;
+  return 0;
+}
+
+void updateTraining() {
+  unsigned long now = millis();
+  if (trainingAdvanceAt && (long)(now - trainingAdvanceAt) >= 0) setTrainingStage(trainingStage + 1);
+  int color = readTrainingColor();
+  if (!color) { buttonsReleased = true; isWaitingForCombo = false; }
+  if (trainingStage >= 9) {
+    if (color && buttonsReleased) { startLevelIntro(config_start_level); return; }
+  } else if (!trainingAdvanceAt) {
+    // A deliberately forgiving combo window teaches the gesture before campaign timing.
+    if (color && buttonsReleased && !isWaitingForCombo && now - lastFireTime > FIRE_COOLDOWN) {
+      isWaitingForCombo = true; comboTimer = now;
+    }
+    if (isWaitingForCombo && now - comboTimer >= (unsigned long)(trainingStage >= 4 && trainingStage <= 7 ? 120 : 0)) {
+      color = readTrainingColor();
+      if (color) { shots.push_back({0.0f, color}); playShotSound(color); lastFireTime = now; }
+      isWaitingForCombo = false; buttonsReleased = false;
+    }
+    if (trainingStage == 8) {
+      trainingFront -= movementStep(8.0f);
+      if (trainingFront <= config_homebase_size + 2) {
+        trainingFront = config_homebase_size + trackLength() * 0.8f;
+        setFeedback(FB_LESSON, "Try again - moving target reset, no penalty");
+      }
+    }
+    for (int i = (int)shots.size() - 1; i >= 0; i--) {
+      shots[i].position += movementStep(90.0f);
+      if (shots[i].position < trainingFront) continue;
+      int firedColor = shots[i].color;
+      shots.erase(shots.begin() + i);
+      if (trainingStage == 3) {
+        if (firedColor != trainingTargetColor) {
+          trainingMistakeShown = true; trainingAddedColor = firedColor;
+          setFeedback(FB_MISTAKE, "Wrong color adds an enemy - keep matching the nearest target");
+          playSound(EVT_MISTAKE); trainingAdvanceAt = now + 1800;
+        } else setFeedback(FB_LESSON, "This lesson asks for a different color to demonstrate the penalty");
+      } else if (firedColor == trainingTargetColor) {
+        setFeedback(FB_HIT, "Correct color - target cleared"); playSound(EVT_HIT_SUCCESS);
+        if (trainingStage == 8 && ++trainingHits < 3) {
+          trainingTargetColor = trainingHits == 1 ? 3 : 1;
+          trainingFront += 1;
+        } else trainingAdvanceAt = now + 900;
+      } else {
+        setFeedback(FB_MISTAKE, "Try the target's color - practice has no penalty"); playSound(EVT_MISTAKE);
+      }
+      // One resolved attempt at a time prevents queued shots from skipping lessons.
+      shots.clear(); break;
+    }
+  }
+  FastLED.clear();
+  if (trainingStage < 9) {
+    if (!trainingAdvanceAt || trainingStage == 3) drawCrispPixel(trainingFront, getColor(trainingTargetColor));
+    if (trainingMistakeShown) drawCrispPixel(trainingFront - 1, getColor(trainingAddedColor));
+    for (auto &shot : shots) drawCrispPixel(shot.position, getColor(shot.color));
+  }
+  // Nine dim progress markers at the far end: completed lessons turn green.
+  for (int i = 0; i < 9; i++) leds[config_num_leds - 1 - i + ledStartOffset] = i < trainingStage ? CRGB(0, 60, 0) : CRGB(8, 8, 8);
+  drawGameFeedback();
+  if (config_sacrifice_led) leds[0] = CRGB(20, 0, 0);
+  FastLED.show();
 }
 
 Melody parseSoundString(String data) {
@@ -337,6 +553,9 @@ void audioTask(void *parameter) {
                     case EVT_BONUS_START: currentMelody = &melWin; break; 
                     case EVT_BONUS_WAVE: currentMelody = &melShotWhite; break;
                     case EVT_BONUS_SPEEDUP: currentMelody = &melSpeedUp; break;
+                    case EVT_BLOCKED: currentMelody = &melBlocked; break;
+                    case EVT_DANGER: currentMelody = &melDanger; break;
+                    case EVT_SHIELD: currentMelody = &melShield; break;
                     default: break;
                 }
                 noteIndex = 0;
@@ -423,6 +642,7 @@ void registerGameEnd(int finalScore) {
 }
 
 void triggerBaseDestruction() {
+  if (currentState != STATE_PLAYING && currentState != STATE_BOSS_PLAYING) return;
   playSound(EVT_LOSE);
   registerGameEnd(currentScore);
   currentState = STATE_BASE_DESTROYED;
@@ -454,7 +674,7 @@ void calculateLevelScore() {
   }
   else {
       // Tank & Normal Levels: Standard calc
-      unsigned long travelTime = config_num_leds * 15;
+      unsigned long travelTime = 240 * 15; // invariant now that travel speed scales with strip length
       unsigned long processingTime = entityCount * 300; 
       targetTime = 3000 + travelTime + processingTime;
   }
@@ -509,8 +729,11 @@ void checkWinCondition() {
 }
 
 void startLevelIntro(int level) {
+  feedbackKind = FB_NONE; feedbackText = ""; feedbackUntil = 0; baseInDanger = false;
+  shots.clear(); buttonsReleased = false; isWaitingForCombo = false;
   playSound(EVT_START);
   if (level == config_start_level) {
+     resetShield();
      currentScore = 0;
      stat_lastGameShots = 0; 
   }
@@ -587,7 +810,7 @@ void startSimonBonus() {
     generateSimonSequence(); 
     currentState = STATE_BONUS_SIMON;
     simonState = S_MOVE;
-    simonTargetPos = config_num_leds - ((simonStopIndex + 1) * (config_num_leds / 12));
+    simonTargetPos = config_num_leds - 1 - (int)((simonStopIndex + 1) * trackLength() / 12.0f);
     playSound(EVT_BONUS_WAVE);
 }
 
@@ -605,7 +828,7 @@ void updateSimonBonus() {
     switch(simonState) {
         case S_MOVE: {
             float spd = 20.0 + (simonStage * 3.0);
-            simonBossPos -= (spd / 60.0);
+            simonBossPos -= movementStep(spd);
             if (simonBossPos <= simonTargetPos) {
                 simonBossPos = (float)simonTargetPos; 
                 simonState = S_PREPARE;
@@ -712,7 +935,7 @@ void updateSimonBonus() {
                      return;
                  }
                  simonStopIndex++;
-                 simonTargetPos = config_num_leds - ((simonStopIndex + 1) * (config_num_leds / 12));
+                 simonTargetPos = config_num_leds - 1 - (int)((simonStopIndex + 1) * trackLength() / 12.0f);
                  simonState = S_MOVE;
             }
             break;
@@ -720,7 +943,7 @@ void updateSimonBonus() {
         case S_FAIL: {
             if (now - simonTimer > 1000) {
                 simonStopIndex++;
-                simonTargetPos = config_num_leds - ((simonStopIndex + 1) * (config_num_leds / 12));
+                simonTargetPos = config_num_leds - 1 - (int)((simonStopIndex + 1) * trackLength() / 12.0f);
                 simonState = S_MOVE;
             }
             break;
@@ -832,17 +1055,17 @@ void updateLevelIntro() {
       else if (currentBossType == 2) {
         for(int i=0; i<9; i++) bossSegments.push_back({0, boss2Cfg.hpPerLed, boss2Cfg.hpPerLed, false, i});
         boss2Section = 0; boss2State = B2_MOVE;
-        markerPos[0] = (int)(config_num_leds * (boss2Cfg.m1 / 100.0));
-        markerPos[1] = (int)(config_num_leds * (boss2Cfg.m2 / 100.0));
-        markerPos[2] = (int)(config_num_leds * (boss2Cfg.m3 / 100.0));
+        markerPos[0] = trackMarker(boss2Cfg.m1);
+        markerPos[1] = trackMarker(boss2Cfg.m2);
+        markerPos[2] = trackMarker(boss2Cfg.m3);
       } 
       else if (currentBossType == 3) {
         for(int i=0; i<15; i++) { int mixColor = random(4, 7);
         bossSegments.push_back({mixColor, boss3Cfg.hpPerLed, boss3Cfg.hpPerLed, true, i}); }
         boss3State = B3_MOVE; 
         boss3PhaseIndex = 0;
-        boss3Markers[0] = (int)(config_num_leds * 0.66);
-        boss3Markers[1] = (int)(config_num_leds * 0.50);
+        boss3Markers[0] = trackMarker(66);
+        boss3Markers[1] = trackMarker(50);
         bossActionTimer = millis();
       }
       currentState = STATE_BOSS_PLAYING;
@@ -931,16 +1154,19 @@ void updateBonusGame() {
         }
     }
     
-    float shotSpeed = (float)config_shot_speed_pct / 60.0 * 0.8;
+    float shotSpeed = movementStep(config_shot_speed_pct * 0.8f);
     for (int i = bonusShots.size() - 1; i >= 0; i--) {
+        float previousShotPos = bonusShots[i].position;
         bonusShots[i].position += shotSpeed;
         bool remove = false;
         
         if (!bonusEnemies.empty()) {
              for(int e=0; e<bonusEnemies.size(); e++) {
-                 if (abs(bonusShots[i].position - bonusEnemies[e].pos) < 1.0) {
+                 if (bonusShots[i].position >= bonusEnemies[e].pos && previousShotPos <= bonusEnemies[e].pos + movementStep(25.0f * bonusSpeedMultiplier) + 1.0f) {
                      if (bonusShots[i].color == bonusEnemies[e].color) {
                          bonusEnemies.erase(bonusEnemies.begin() + e);
+                         setFeedback(FB_HIT, "HIT: bonus target cleared");
+                         playSound(EVT_HIT_SUCCESS);
                          currentScore += 500; 
                          flashPixel((int)bonusShots[i].position);
                          remove = true;
@@ -948,6 +1174,7 @@ void updateBonusGame() {
                      } else {
                          remove = true;
                          bonusLives--;
+                         setFeedback(FB_MISTAKE, "MISS: wrong bonus color costs a life");
                          playSound(EVT_MISTAKE);
                          break;
                      }
@@ -964,7 +1191,7 @@ void updateBonusGame() {
         if (remove) bonusShots.erase(bonusShots.begin() + i);
     }
     
-    float enemySpeed = (25.0 / 60.0) * bonusSpeedMultiplier;
+    float enemySpeed = movementStep(25.0f * bonusSpeedMultiplier);
     for (int i = bonusEnemies.size() - 1; i >= 0; i--) {
         bonusEnemies[i].pos -= enemySpeed;
         if (bonusEnemies[i].pos <= config_homebase_size) {
@@ -1050,12 +1277,13 @@ void updateBaseDestroyedAnim() {
 
 void moveBossProjectiles(float speed) {
   static unsigned long lastMove = 0;
-  float step = (float)speed / 60.0;
-  if (step < 0.1) step = 0.1;
+  float step = movementStep(max(6.0f, speed));
   for(int i=bossProjectiles.size()-1; i>=0; i--) {
       bossProjectiles[i].pos -= step;
       if (bossProjectiles[i].pos < config_homebase_size) {
-        triggerBaseDestruction();
+        bossProjectiles.erase(bossProjectiles.begin() + i);
+        // A real hit clears this vector. Return before using its old indices.
+        if (damageShield()) return;
       }
   }
 }
@@ -1137,6 +1365,9 @@ void loadSounds() {
   melodyFromStr(melShotY, DEF_SND_SHOT_Y);
   melodyFromStr(melShotM, DEF_SND_SHOT_M);
   melodyFromStr(melShotC, DEF_SND_SHOT_C);
+  melodyFromStr(melBlocked, "300,45;0,40;300,45");
+  melodyFromStr(melDanger, "440,80;0,80;660,120");
+  melodyFromStr(melShield, "330,60;220,90;110,120");
 }
 
 void handleSaveSounds() {
@@ -1239,6 +1470,7 @@ void performFactoryReset() {
   preferences.putBool("snd_on", true);
   preferences.putInt("snd_vol", 50);
   preferences.putBool("endless", false);
+  preferences.putBool("training", false);
 
   preferences.putULong("st_shots", 0);
   preferences.putULong("st_kills", 0);
@@ -1279,6 +1511,7 @@ void loadConfig(String prefix) {
   config_sound_on = preferences.getBool("snd_on", true);
   config_volume_pct = preferences.getInt("snd_vol", 50);
   config_endless_mode = preferences.getBool("endless", false);
+  config_training_on_start = preferences.getBool("training", false);
 
   for(int i=1; i<=10; i++) { 
     levels[i].speed = preferences.getInt((prefix+"l"+String(i)+"s").c_str(), levels[i].speed);
@@ -1317,6 +1550,7 @@ void handleSave() {
   config_sacrifice_led = server.hasArg("sac_led");
   config_sound_on = server.hasArg("snd_on");
   config_endless_mode = server.hasArg("endless");
+  config_training_on_start = server.hasArg("training");
   if(server.hasArg("vol")) config_volume_pct = server.arg("vol").toInt();
 
   preferences.begin("game", false); 
@@ -1329,6 +1563,7 @@ void handleSave() {
   preferences.putBool("snd_on", config_sound_on);
   preferences.putInt("snd_vol", config_volume_pct);
   preferences.putBool("endless", config_endless_mode);
+  preferences.putBool("training", config_training_on_start);
   String p = currentProfilePrefix; preferences.putInt((p+"leds").c_str(), config_num_leds);
   preferences.putInt((p+"bright").c_str(), config_brightness_pct); preferences.putInt((p+"startlvl").c_str(), config_start_level); 
   for(int i=1; i<=10; i++) { levels[i].speed = server.arg("lspd"+String(i)).toInt();
@@ -1447,10 +1682,12 @@ h += "<div class='sub-head'>created by WorksAsDesigned - <span style='cursor:poi
   h += "<a href='/colors' style='flex:1;'><button style='background:#00ffff;color:#000;font-weight:bold;font-size:1.1em;padding:12px;'>🎨 COLOR CONFIG</button></a>";
   h += "</div>";
 
+  h += "<div class='sec'><h3>Three-hit shield</h3><p>Each new campaign starts with 3 shield points. Enemy or boss-projectile breaches cost one point; the third ends the run. Remaining charge carries across levels. A surviving hit pushes enemies back and gives one second of recovery. The base LEDs show shield charge.</p></div><div class='sec'><h3>Guided Training</h3><p>Unscored practice: RGB, wrong-color penalty, mixed colors, then moving targets. Hold Menu 1-3 seconds and release to enter training; tap Menu to start a normal run.</p><form action='/training' method='POST'><button type='submit'>START TRAINING</button></form><p>Base feedback: green = hit, amber = mistake, violet = protected boss, orange = danger.</p><p>Movement is normalized to a 240-LED reference board; changing LED count preserves travel time.</p></div>";
   String pName = (currentProfilePrefix == "def_") ? "Standard" : ((currentProfilePrefix == "kid_") ? "Kids" : "Pro");
   h += "<div class='sec'><h3>Profile Management</h3>Current Profile: <b>" + pName + "</b><br><form action='/loadprofile' method='POST' style='display:flex;gap:5px;margin-top:5px;'><select name='profile'><option value='def' " + String(currentProfilePrefix=="def_"?"selected":"") + ">Standard</option><option value='kid' " + String(currentProfilePrefix=="kid_"?"selected":"") + ">Kids</option><option value='pro' " + String(currentProfilePrefix=="pro_"?"selected":"") + ">Pro/Party</option></select><button type='submit'>Load Profile</button></form></div>";
   String maxLvl = (stat_boss3Kills > 0) ? "11" : "10";
-  h += "<form action='/save' method='POST'><div class='sec'><h3>Hardware & General</h3>Start Level: <input type='number' name='startlvl' min='1' max='" + maxLvl + "' value='" + String(config_start_level) + "'><br>";
+  h += "<form action='/save' method='POST'><div class='sec'><h3>Hardware & General</h3>";
+  h += "<label>Start with training: <input type='checkbox' name='training' value='1' " + String(config_training_on_start?"checked":"") + " style='width:auto;'></label><br>Start Level: <input type='number' name='startlvl' min='1' max='" + maxLvl + "' value='" + String(config_start_level) + "'><br>";
   h += "Total LEDs: <input id='ledCount' type='number' name='leds' value='" + String(config_num_leds) + "' oninput='updateCalc()'><br>";
   h += "<label>Sacrificial LED: <input type='checkbox' name='sac_led' value='1' " + String(config_sacrifice_led?"checked":"") + " style='width:auto;'></label><br>";
   h += "<label>Homebase Size: <input type='number' name='hb_size' min='1' max='5' value='" + String(config_homebase_size) + "'></label><br>";
@@ -1557,6 +1794,7 @@ void setup() {
   // WEB ROUTES
   server.on("/", []() { server.send(200, "text/html", getHTML()); }); 
   server.on("/save", handleSave); 
+  server.on("/training", []() { startTraining(); server.send(200, "text/html", "<h2>Training started</h2><p>Follow the target colors. Hold Menu for 1-3 seconds to restart training; tap Menu to return to the campaign.</p><a href='/'>Settings</a>"); });
   server.on("/loadprofile", handleProfileSwitch); 
   server.on("/reset", handleReset);
   server.on("/sounds", []() { server.send(200, "text/html", getSoundHTML()); });
@@ -1585,12 +1823,14 @@ void setup() {
       if (Update.end(true)) Serial.printf("Update Success: %u\n", upload.totalSize); else Update.printError(Serial);
     }
   });
-  startLevelIntro(config_start_level);
+  if (config_training_on_start) startTraining();
+  else startLevelIntro(config_start_level);
 }
 
 void loop() {
   unsigned long now = millis();
   if (now - lastLoopTime < FRAME_DELAY) return;
+  frameSeconds = min((unsigned long)64, now - lastLoopTime) / 1000.0f;
   lastLoopTime = now;
   if (wifiMode) {
     server.handleClient();
@@ -1626,9 +1866,13 @@ void loop() {
           wifiMode = true; enableWiFi(); return; 
       } else if (holdTime < 1000) {
           startLevelIntro(config_start_level);
+      } else {
+          startTraining();
       }
     }
   }
+
+  if (currentState == STATE_TRAINING) { updateTraining(); return; }
 
   // GAME STATES DISPATCHER
   if (currentState == STATE_LEVEL_COMPLETED) { updateLevelCompletedAnim(); return; }
@@ -1689,10 +1933,9 @@ void loop() {
     }
 
     // SHOT MOVEMENT
-    float moveStep = (float)config_shot_speed_pct / 60.0;
-    moveStep = moveStep * 0.6; 
-    if(moveStep < 0.2) moveStep = 0.2;
+    float moveStep = movementStep(max(12.0f, config_shot_speed_pct * 0.6f));
     for (int i = shots.size() - 1; i >= 0; i--) {
+        float previousShotPos = shots[i].position;
         shots[i].position += moveStep;
         bool remove = false;
         
@@ -1703,10 +1946,12 @@ void loop() {
                 enemies.erase(enemies.begin());
                 stat_totalKills++; 
                 enemyFrontIndex += 1.0;
-                flashPixel((int)shots[i].position); 
+                setFeedback(FB_HIT, "HIT: matching enemy cleared");
+                playSound(EVT_HIT_SUCCESS);
                 remove = true; 
                 checkWinCondition(); 
              } else { 
+                setFeedback(FB_MISTAKE, "MISS: wrong color added an enemy");
                 enemies.insert(enemies.begin(), {shots[i].color, 0.0});
                 enemyFrontIndex -= 1.0; 
                 remove = true; 
@@ -1720,7 +1965,11 @@ void loop() {
               if(shots[i].position >= bossProjectiles[p].pos) { 
                   if(shots[i].color == bossProjectiles[p].color) { 
                       bossProjectiles.erase(bossProjectiles.begin() + p);
-                      flashPixel((int)shots[i].position); 
+                      setFeedback(FB_INTERCEPT, "INTERCEPT: incoming projectile cleared");
+                      playSound(EVT_HIT_SUCCESS);
+                  } else {
+                      setFeedback(FB_MISTAKE, "MISS: projectile needs the matching color");
+                      playSound(EVT_MISTAKE);
                   } 
                   remove = true;
                   break; 
@@ -1731,7 +1980,8 @@ void loop() {
           if (!remove && shots[i].position >= enemyFrontIndex - 0.5 && !bossSegments.empty()) { 
              
              // GENERAL CLAMPING LOGIC FOR ALL BOSSES (v10.9.2 FIX)
-             int hitIndex = (int)round(shots[i].position - enemyFrontIndex);
+             // A swept shot crossing the front hits the first segment, even on long strips.
+             int hitIndex = previousShotPos < enemyFrontIndex - 0.5f ? 0 : (int)round(shots[i].position - enemyFrontIndex);
              
              // Prevent Tunneling: If shot is 'deep' inside/behind, clamp to last segment
              if (hitIndex >= bossSegments.size()) hitIndex = bossSegments.size() - 1;
@@ -1746,7 +1996,8 @@ void loop() {
                
                if (vulnerable) { 
                  if (shots[i].color == bossSegments[hitIndex].color) { 
-                    flashPixel((int)shots[i].position);
+                    setFeedback(FB_HIT, "HIT: boss armor damaged");
+                    playSound(EVT_HIT_SUCCESS);
                     bossSegments[hitIndex].hp--; 
                     if (bossSegments[hitIndex].hp <= 0) { 
                         bossSegments.erase(bossSegments.begin() + hitIndex);
@@ -1756,6 +2007,8 @@ void loop() {
                     } 
                     checkWinCondition();
                  } else {
+                    setFeedback(FB_MISTAKE, "MISS: boss segment needs the matching color");
+                    playSound(EVT_MISTAKE);
                     if (currentBossType == 1) {
                          currentScore = (currentScore > 50) ? currentScore - 50 : 0;
                          if(!boss1RageMode) {
@@ -1768,6 +2021,9 @@ void loop() {
                          }
                     }
                  }
+               } else {
+                   setFeedback(FB_BLOCKED, "BLOCKED: boss is protected - wait for vulnerability");
+                   playSound(EVT_BLOCKED);
                } remove = true;
              } 
           }
@@ -1783,18 +2039,19 @@ void loop() {
         if(currentLevel > 10) mapLevel = ((currentLevel - 1) % 10) + 1;
         spdVal = levels[mapLevel].speed;
         float enemySpeed = (float)spdVal;
-        float eStep = enemySpeed / 60.0; 
+        float eStep = movementStep(enemySpeed);
         enemyFrontIndex -= eStep; 
-        if (enemyFrontIndex <= config_homebase_size) { triggerBaseDestruction(); } 
+        if (enemyFrontIndex <= config_homebase_size) { damageShield(); if (currentState == STATE_BASE_DESTROYED) return; }
     }
     else if (currentState == STATE_BOSS_PLAYING) {
       int pSpeed = 60;
       if (currentBossType == 1) pSpeed = boss1Cfg.shotSpeed; if (currentBossType == 2) pSpeed = boss2Cfg.shotSpeed; 
       moveBossProjectiles((float)pSpeed);
+      if (currentState == STATE_BASE_DESTROYED) return;
       if (currentBossType == 1) { // THE TANK
-        float bStep = (float)boss1Cfg.moveSpeed / 60.0;
+        float bStep = movementStep(boss1Cfg.moveSpeed);
         enemyFrontIndex -= bStep;
-        if (enemyFrontIndex <= config_homebase_size) { triggerBaseDestruction(); } 
+        if (enemyFrontIndex <= config_homebase_size) { damageShield(); if (currentState == STATE_BASE_DESTROYED) return; }
         
         if (boss1RageMode) {
              if (now - bossActionTimer > 200) { 
@@ -1827,7 +2084,7 @@ void loop() {
       }
       else if (currentBossType == 2) { // MASTERBLASTER
           if (boss2State == B2_MOVE) {
-             float bStep = (float)boss2Cfg.moveSpeed / 60.0;
+             float bStep = movementStep(boss2Cfg.moveSpeed);
              enemyFrontIndex -= bStep;
              if (boss2Section < 3) { if (enemyFrontIndex <= markerPos[boss2Section]) { 
                  boss2State = B2_CHARGE;
@@ -1842,7 +2099,7 @@ void loop() {
                  }
                  boss2TargetShots = 10 + (oldSurvivors * 3);
              } } 
-             if (enemyFrontIndex <= config_homebase_size) { triggerBaseDestruction(); } 
+             if (enemyFrontIndex <= config_homebase_size) { damageShield(); if (currentState == STATE_BASE_DESTROYED) return; }
           }
           else if (boss2State == B2_CHARGE) { if (now - bossActionTimer < (boss2Cfg.shotFreq * 100)) { if (now % 100 < 20) boss2LockedColor = random(1,4);
             } else { boss2State = B2_SHOOT; boss2ShotsFired = 0; bossActionTimer = now; int startRange = 0; int endRange = 0;
@@ -1857,15 +2114,15 @@ void loop() {
               } boss2State = B2_MOVE; boss2Section++; } } } 
       }
       else if (currentBossType == 3) { // OVERLORD
-        float safeFireLimit = (config_num_leds > 180) ? 70.0 : (float)(config_homebase_size + 5);
+        float safeFireLimit = config_homebase_size + trackLength() * (70.0f - config_homebase_size) / (239.0f - config_homebase_size);
         if (boss3State == B3_MOVE && boss3PhaseIndex < 2 && enemyFrontIndex <= boss3Markers[boss3PhaseIndex]) {
              boss3State = B3_PHASE_CHANGE; bossActionTimer = now; 
         }
 
         if (boss3State == B3_MOVE) {
-           float bStep = (float)boss3Cfg.moveSpeed / 60.0;
+           float bStep = movementStep(boss3Cfg.moveSpeed);
            enemyFrontIndex -= bStep;
-           if (enemyFrontIndex <= config_homebase_size) { triggerBaseDestruction(); }
+           if (enemyFrontIndex <= config_homebase_size) { damageShield(); if (currentState == STATE_BASE_DESTROYED) return; }
 
            if (enemyFrontIndex > safeFireLimit && boss3Cfg.shotFreq > 0 && (now - bossActionTimer > (boss3Cfg.shotFreq * 100))) { 
                bossActionTimer = now;
@@ -1930,7 +2187,8 @@ void loop() {
       for(auto &p : bossProjectiles) { drawCrispPixel(p.pos, getColor(p.color)); } 
     }
     for(auto &s : shots) { drawCrispPixel(s.position, getColor(s.color)); }
-    for(int i=0; i<config_homebase_size; i++) leds[i+ledStartOffset] = CRGB::White;
+    updateDangerFeedback();
+    drawGameFeedback();
     if(config_sacrifice_led) leds[0] = CRGB(20,0,0); 
     FastLED.show();
   }

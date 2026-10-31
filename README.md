@@ -1,3 +1,15 @@
+# Enhanced ESP32-S3-Zero game
+
+This fork adds a three-hit shield, guided training, consistent travel times across strip lengths, and clearer gameplay feedback. Green uses GPIO8 and White/Menu uses GPIO9.
+
+- [Installation and wiring](INSTALL.md)
+- [Gameplay changes and validation](ENHANCEMENTS.md)
+- [Build and run the firmware emulator](emulator/README.md)
+
+The binaries in the original `bin` folder predate these enhancements. Build the edited source to install this version.
+
+---
+
 # ⚠️ This is just the short version of documentation ⚠️    
 check for detailed docu&howto @ instructables.com  
 
