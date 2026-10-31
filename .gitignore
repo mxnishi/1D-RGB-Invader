@@ -1,0 +1,5 @@
+.DS_Store
+emulator/emulator
+emulator/sketch.generated.cpp
+emulator/preferences.txt
+emulator/__pycache__/
